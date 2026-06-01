@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Proyecto Rossmann ---
+data/
+outputs/
+*.h5
+*.weights.h5
+*.parquet
+*.keras
