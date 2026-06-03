@@ -20,75 +20,76 @@ from sklearn.metrics import r2_score
 
 TARGET_STORES = [1, 2, 3, 4, 5, 562, 682, 733, 769]
 
-SPLIT_TRAIN_END  = pd.Timestamp("2014-09-30")   # último día de entrenamiento
-SPLIT_VAL_START  = pd.Timestamp("2014-10-01")   # inicio de validación interna
-SPLIT_VAL_END    = pd.Timestamp("2014-12-31")   # fin de validación (incluye Navidad)
-SPLIT_TEST_START = pd.Timestamp("2015-01-01")   # inicio del test evaluado por el profesor
+SPLIT_TRAIN_END  = pd.Timestamp("2014-09-30")
+SPLIT_VAL_START  = pd.Timestamp("2014-10-01")
+SPLIT_VAL_END    = pd.Timestamp("2014-12-31")
+SPLIT_TEST_START = pd.Timestamp("2015-01-01")
 
 
 # ---------------------------------------------------------------------------
-# Funciones de evaluación
+# Helpers internos
 # ---------------------------------------------------------------------------
 
 def _inverse_transform(y_norm: np.ndarray, store_id: int, store_stats: dict) -> np.ndarray:
-    """
-    Desnormaliza predicciones: expm1(y_norm * std + mean).
-
-    Asume que la normalización aplicada fue:
-        y_norm = (log1p(Sales) - mean_store) / std_store
-
-    Parameters
-    ----------
-    y_norm : np.ndarray, shape (n,)
-        Valores normalizados a deshacer.
-    store_id : int
-        ID de la tienda (clave en store_stats).
-    store_stats : dict
-        {store_id: {'mean': float, 'std': float}} generado por
-        preprocessing.build_store_normalizer sobre el split de train.
-
-    Returns
-    -------
-    np.ndarray
-        Sales predichas en escala original (euros).
-    """
+    """Desnormaliza: expm1(y_norm * std + mean)."""
     stats = store_stats[store_id]
     return np.expm1(y_norm * stats["std"] + stats["mean"])
 
+
+def _per_store_arrays(
+    df: pd.DataFrame,
+    y_pred_norm: np.ndarray,
+    store_stats: dict,
+) -> dict:
+    """
+    Alinea y_pred_norm (producido por build_sequences) con las filas de df.
+
+    build_sequences genera n_store - DEFAULT_SEQ_LEN predicciones por tienda,
+    saltándose las primeras DEFAULT_SEQ_LEN filas (usadas como contexto).
+    Este helper recorre las tiendas en el mismo orden que build_sequences
+    (groupby "Store" con sort=True) para mantener el cursor sobre y_pred_norm.
+
+    Devuelve {store_id: (y_true_euros, y_pred_euros)} solo para TARGET_STORES.
+    """
+    from src.preprocessing import DEFAULT_SEQ_LEN  # import local para evitar ciclo en módulo
+
+    result = {}
+    cursor = 0  # posición actual dentro de y_pred_norm
+
+    for store_id, grp in df.groupby("Store"):
+        grp_sorted = grp.sort_values("Date")
+        n_preds = max(0, len(grp_sorted) - DEFAULT_SEQ_LEN)
+
+        if store_id not in TARGET_STORES or n_preds == 0:
+            cursor += n_preds
+            continue
+
+        # Filas con predicción (las primeras DEFAULT_SEQ_LEN son solo contexto)
+        grp_target = grp_sorted.iloc[DEFAULT_SEQ_LEN:]
+        y_true = grp_target["Sales"].values
+        y_pred = _inverse_transform(
+            y_pred_norm[cursor : cursor + n_preds], store_id, store_stats
+        )
+        result[store_id] = (y_true, y_pred)
+        cursor += n_preds
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# API pública
+# ---------------------------------------------------------------------------
 
 def r2_per_store(
     df: pd.DataFrame,
     y_pred_norm: np.ndarray,
     store_stats: dict,
 ) -> pd.Series:
-    """
-    Calcula R² individual para cada tienda de TARGET_STORES en el split de test.
-
-    Protocolo (NO alterar):
-      1. Filtra df a Date >= SPLIT_TEST_START y Open == 1.
-      2. Para cada tienda en TARGET_STORES presente en df:
-         a. Extrae índices de esas filas en df filtrado.
-         b. Recupera Sales_true = df["Sales"].
-         c. Recupera Sales_pred = _inverse_transform(y_pred_norm[índices], store_id, store_stats).
-         d. Calcula r2_score(Sales_true, Sales_pred).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Debe contener columnas [Store, Date, Open, Sales].
-        El orden de filas debe coincidir exactamente con y_pred_norm.
-    y_pred_norm : np.ndarray, shape (n,)
-        Salida del modelo en espacio normalizado, mismo orden que df.
-    store_stats : dict
-        {store_id: {'mean': float, 'std': float}} de preprocessing.build_store_normalizer.
-
-    Returns
-    -------
-    pd.Series
-        Index = store_id (int), values = R² (float).
-        Solo incluye tiendas de TARGET_STORES presentes en df.
-    """
-    raise NotImplementedError
+    """R² individual para cada tienda de TARGET_STORES en el split de test."""
+    pairs = _per_store_arrays(df, y_pred_norm, store_stats)
+    return pd.Series(
+        {sid: r2_score(yt, yp) for sid, (yt, yp) in pairs.items()}
+    )
 
 
 def r2_global(
@@ -96,27 +97,11 @@ def r2_global(
     y_pred_norm: np.ndarray,
     store_stats: dict,
 ) -> float:
-    """
-    R² agregado sobre todas las tiendas de TARGET_STORES en el split de test.
-
-    Concatena Sales_true y Sales_pred de todas las tiendas objetivo y aplica
-    un único r2_score sobre el vector concatenado (pooled R²).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Mismo contrato que r2_per_store.
-    y_pred_norm : np.ndarray, shape (n,)
-        Mismo contrato que r2_per_store.
-    store_stats : dict
-        Mismo contrato que r2_per_store.
-
-    Returns
-    -------
-    float
-        R² global (pooled).
-    """
-    raise NotImplementedError
+    """R² pooled sobre todas las tiendas de TARGET_STORES en el split de test."""
+    pairs = _per_store_arrays(df, y_pred_norm, store_stats)
+    all_true = np.concatenate([yt for yt, _ in pairs.values()])
+    all_pred = np.concatenate([yp for _, yp in pairs.values()])
+    return float(r2_score(all_true, all_pred))
 
 
 def evaluation_report(
@@ -125,29 +110,33 @@ def evaluation_report(
     store_stats: dict,
 ) -> pd.DataFrame:
     """
-    Imprime y devuelve la tabla de resultados con R² por tienda y global.
+    Tabla de resultados con R² por tienda + fila GLOBAL.
 
-    Columnas del DataFrame devuelto:
-        Store           : int o 'GLOBAL'
-        n_samples       : número de días en test (Open==1)
-        R2              : R² de esa tienda (o pooled si Store=='GLOBAL')
-        mean_sales_true : media de Sales reales en test
-        mean_sales_pred : media de Sales predichas en test
-
-    La última fila tiene Store='GLOBAL' con el pooled R² de r2_global().
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Mismo contrato que r2_per_store.
-    y_pred_norm : np.ndarray, shape (n,)
-        Mismo contrato que r2_per_store.
-    store_stats : dict
-        Mismo contrato que r2_per_store.
-
-    Returns
-    -------
-    pd.DataFrame
-        Tabla de resultados (también impresa por stdout con formato legible).
+    Columnas: Store | n_samples | R2 | mean_sales_true | mean_sales_pred
     """
-    raise NotImplementedError
+    pairs = _per_store_arrays(df, y_pred_norm, store_stats)
+
+    rows = [
+        {
+            "Store":           sid,
+            "n_samples":       len(yt),
+            "R2":              r2_score(yt, yp),
+            "mean_sales_true": yt.mean(),
+            "mean_sales_pred": yp.mean(),
+        }
+        for sid, (yt, yp) in pairs.items()
+    ]
+
+    all_true = np.concatenate([yt for yt, _ in pairs.values()])
+    all_pred = np.concatenate([yp for _, yp in pairs.values()])
+    rows.append({
+        "Store":           "GLOBAL",
+        "n_samples":       len(all_true),
+        "R2":              r2_score(all_true, all_pred),
+        "mean_sales_true": all_true.mean(),
+        "mean_sales_pred": all_pred.mean(),
+    })
+
+    report_df = pd.DataFrame(rows)
+    print(report_df.to_string(index=False, float_format="{:.4f}".format))
+    return report_df

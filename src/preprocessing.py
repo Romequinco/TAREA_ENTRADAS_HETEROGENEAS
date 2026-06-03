@@ -16,8 +16,10 @@ Todas las fechas de corte se importan de evaluate.py para garantizar
 coherencia con la evaluación.
 """
 
+import os
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import LabelEncoder
 
 from src.evaluate import (
     SPLIT_TRAIN_END,
@@ -26,21 +28,18 @@ from src.evaluate import (
     SPLIT_TEST_START,
 )
 
-# Longitud de secuencia por defecto para el LSTM (días abiertos consecutivos)
 DEFAULT_SEQ_LEN = 30
 
 # Columnas que entran en la rama recurrente (orden fijo — no alterar)
 SEQ_FEATURE_COLS = [
-    "Sales_norm",    # target desplazado un paso (teacher forcing en train)
+    "Sales_norm",
     "Promo",
-    "DayOfWeek_sin",
-    "DayOfWeek_cos",
-    "month_sin",
-    "month_cos",
-    "week_sin",
-    "week_cos",
+    "DayOfWeek_sin", "DayOfWeek_cos",
+    "month_sin",     "month_cos",
+    "week_sin",      "week_cos",
     "SchoolHoliday",
     "StateHoliday_enc",
+    "days_since_start",  # tendencia lineal — crítica para tienda 769
 ]
 
 # Columnas numéricas que entran en la rama densa
@@ -53,224 +52,157 @@ STATIC_NUM_COLS = [
 
 # Columnas categóricas que entran en la rama densa (como índices enteros)
 STATIC_CAT_COLS = [
-    "Store_enc",        # embedding dim 16 en model.py
-    "StoreType_enc",    # embedding dim 2
-    "Assortment_enc",   # embedding dim 2
-    "PromoInterval_enc",# embedding dim 2
+    "Store_enc",         # embedding dim 16
+    "StoreType_enc",     # embedding dim 2
+    "Assortment_enc",    # embedding dim 2
+    "PromoInterval_enc", # embedding dim 2
 ]
 
 
 def load_raw_data(data_dir: str) -> tuple:
-    """
-    Carga train.csv y store.csv desde data_dir.
-
-    Parameters
-    ----------
-    data_dir : str
-        Ruta a la carpeta data/ (p.ej. '../data').
-
-    Returns
-    -------
-    (train_df, store_df) : tuple de DataFrames
-        train_df  — 1.001.599 filas, columna Date como datetime64.
-        store_df  — 1.115 filas con metadatos de tiendas.
-    """
-    raise NotImplementedError
+    """Carga train.csv y store.csv desde data_dir."""
+    train_df = pd.read_csv(
+        os.path.join(data_dir, "train.csv"),
+        parse_dates=["Date"],
+        low_memory=False,
+    )
+    store_df = pd.read_csv(os.path.join(data_dir, "store.csv"))
+    return train_df, store_df
 
 
 def clean_train(train_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Elimina filas que no deben entrar en el modelo:
-      - Open == 0  (ventas siempre 0, 17% del dataset)
-      - Sales == 0 con Open == 1  (54 casos, ruido/errores de registro)
-
-    Parameters
-    ----------
-    train_df : pd.DataFrame
-        DataFrame crudo de train.csv.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame limpio (~830.972 filas).
-    """
-    raise NotImplementedError
+    """Elimina días cerrados (Open==0) y los 54 registros con Sales==0 estando abierto."""
+    return train_df[(train_df["Open"] == 1) & (train_df["Sales"] > 0)].copy()
 
 
 def merge_store_features(train_df: pd.DataFrame, store_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Une store.csv a train_df por Store e imputa nulos:
-      - CompetitionDistance: mediana global (3 nulos).
-      - CompetitionOpenSinceYear/Month: 0 cuando es NaN (sin competencia conocida).
-      - Promo2SinceWeek/Year y PromoInterval: solo para Promo2==1; NaN en Promo2==0 es correcto.
-
-    Parameters
-    ----------
-    train_df : pd.DataFrame
-        Resultado de clean_train().
-    store_df : pd.DataFrame
-        DataFrame crudo de store.csv.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con columnas de store añadidas (~830.972 filas, +9 columnas).
+    Une store.csv a train_df e imputa nulos.
+    CompetitionOpenSinceYear/Month → 0 cuando NaN (sin competencia conocida).
     """
-    raise NotImplementedError
+    df = train_df.merge(store_df, on="Store", how="left")
+    df["CompetitionDistance"].fillna(df["CompetitionDistance"].median(), inplace=True)
+    df["CompetitionOpenSinceYear"].fillna(0, inplace=True)
+    df["CompetitionOpenSinceMonth"].fillna(0, inplace=True)
+    # PromoInterval NaN (tiendas con Promo2==0) se mantiene: se codifica como 'None'
+    return df
 
 
 def encode_categoricals(df: pd.DataFrame) -> tuple:
     """
-    Label-encoding de variables categóricas en columnas *_enc.
-
-    Codifica: Store → Store_enc, StoreType → StoreType_enc,
-              Assortment → Assortment_enc, PromoInterval → PromoInterval_enc,
-              StateHoliday → StateHoliday_enc.
-
-    Los índices empiezan en 0 y son continuos (necesario para Embedding de Keras).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Resultado de merge_store_features().
-
-    Returns
-    -------
-    (df, encoders) : tuple
-        df       — DataFrame con columnas *_enc añadidas.
-        encoders — dict {col_name: LabelEncoder} para invertir si hace falta.
+    Label-encoding de variables categóricas → columnas *_enc (índices 0-based).
+    Devuelve (df_con_enc, dict_encoders).
     """
-    raise NotImplementedError
+    encoders = {}
+    for col in ["Store", "StoreType", "Assortment", "PromoInterval", "StateHoliday"]:
+        le = LabelEncoder()
+        # Normalizar a str para manejar NaN, mixed-types y el '0' string de StateHoliday
+        df[f"{col}_enc"] = le.fit_transform(df[col].fillna("None").astype(str))
+        encoders[col] = le
+    return df, encoders
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Añade features temporales y de competencia.
+    """Añade features temporales cíclicas, de competencia y tendencia lineal."""
+    df = df.copy()
 
-    Features temporales (codificación cíclica sin/cos):
-      - DayOfWeek_sin, DayOfWeek_cos  (período 7)
-      - month_sin,     month_cos       (período 12)
-      - week_sin,      week_cos        (período 52)
+    # Features cíclicas: sin/cos evitan la discontinuidad en los extremos del período
+    df["DayOfWeek_sin"] = np.sin(2 * np.pi * df["DayOfWeek"] / 7)
+    df["DayOfWeek_cos"] = np.cos(2 * np.pi * df["DayOfWeek"] / 7)
+    df["month_sin"] = np.sin(2 * np.pi * df["Date"].dt.month / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["Date"].dt.month / 12)
+    week = df["Date"].dt.isocalendar().week.astype(int)
+    df["week_sin"] = np.sin(2 * np.pi * week / 52)
+    df["week_cos"] = np.cos(2 * np.pi * week / 52)
 
-    Features de competencia:
-      - has_competition : 1 si CompetitionOpenSinceYear no era nulo original, 0 si no.
-      - competition_age_years : años desde apertura competencia hasta la fecha del registro
-                                (clip a [0, 20]). 0 si has_competition == 0.
+    # Competencia — year==0 significa "sin competencia conocida" (imputado en merge)
+    df["has_competition"] = (df["CompetitionOpenSinceYear"] != 0).astype(np.int8)
+    comp_year  = df["CompetitionOpenSinceYear"].replace(0, 1900).astype(int)
+    comp_month = df["CompetitionOpenSinceMonth"].clip(lower=1).replace(0, 1).astype(int)
+    comp_open  = pd.to_datetime(
+        {"year": comp_year, "month": comp_month, "day": 1}, errors="coerce"
+    )
+    age = (df["Date"] - comp_open).dt.days / 365.25
+    df["competition_age_years"] = (
+        age.clip(0, 20).fillna(0) * df["has_competition"]
+    ).astype(np.float32)
 
-    Features de tendencia:
-      - days_since_start : días desde 2013-01-01 (captura tendencia lineal).
+    # Tendencia lineal global (días desde inicio del dataset)
+    df["days_since_start"] = (df["Date"] - pd.Timestamp("2013-01-01")).dt.days
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Resultado de encode_categoricals().
+    # CompetitionDistance normalizada (feature estática → normalización global no introduce leakage temporal)
+    med = df["CompetitionDistance"].median()
+    std = df["CompetitionDistance"].std()
+    df["CompetitionDistance_norm"] = ((df["CompetitionDistance"] - med) / std).astype(np.float32)
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con las nuevas columnas añadidas.
-    """
-    raise NotImplementedError
+    return df
 
 
 def temporal_split(df: pd.DataFrame) -> tuple:
-    """
-    Divide df en tres splits por fecha usando las constantes de evaluate.py.
-
-      - train : Date <= SPLIT_TRAIN_END  (hasta 2014-09-30)
-      - val   : SPLIT_VAL_START <= Date <= SPLIT_VAL_END  (oct–dic 2014)
-      - test  : Date >= SPLIT_TEST_START  (desde 2015-01-01)
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame completamente preprocesado.
-
-    Returns
-    -------
-    (df_train, df_val, df_test) : tuple de DataFrames
-        Tamaños aproximados: 648.360 / 75.860 / 182.612 filas.
-    """
-    raise NotImplementedError
+    """Divide en train / val / test usando las fechas de evaluate.py."""
+    train = df[df["Date"] <= SPLIT_TRAIN_END].copy()
+    val   = df[(df["Date"] >= SPLIT_VAL_START) & (df["Date"] <= SPLIT_VAL_END)].copy()
+    test  = df[df["Date"] >= SPLIT_TEST_START].copy()
+    return train, val, test
 
 
 def build_store_normalizer(df_train: pd.DataFrame) -> dict:
     """
     Calcula media y std de log1p(Sales) por tienda, ajustando SOLO sobre df_train.
-
-    La normalización es log1p + z-score por tienda:
-        Sales_norm = (log1p(Sales) - mean_store) / std_store
-
-    Importante: se ajusta solo con df_train para evitar data leakage
-    en val y test.
-
-    Parameters
-    ----------
-    df_train : pd.DataFrame
-        Split de entrenamiento (resultado de temporal_split()[0]).
-
-    Returns
-    -------
-    dict
-        {store_id: {'mean': float, 'std': float}}
-        Para cada tienda presente en df_train.
+    Devuelve {store_id: {'mean': float, 'std': float}}.
     """
-    raise NotImplementedError
+    stats = {}
+    for store_id, grp in df_train.groupby("Store"):
+        log_s = np.log1p(grp["Sales"])
+        stats[int(store_id)] = {"mean": float(log_s.mean()), "std": float(log_s.std())}
+    return stats
 
 
 def normalize_sales(df: pd.DataFrame, store_stats: dict) -> pd.DataFrame:
-    """
-    Aplica la normalización log1p + z-score por tienda usando store_stats.
-
-    Añade la columna 'Sales_norm' al DataFrame.
-    Los stats de store_stats proceden siempre de build_store_normalizer(df_train)
-    para val y test.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Cualquiera de los tres splits.
-    store_stats : dict
-        Resultado de build_store_normalizer().
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con columna 'Sales_norm' añadida.
-    """
-    raise NotImplementedError
+    """Añade columna 'Sales_norm' = (log1p(Sales) - mean_store) / std_store."""
+    df = df.copy()
+    means = df["Store"].map({k: v["mean"] for k, v in store_stats.items()})
+    stds  = df["Store"].map({k: max(v["std"], 1e-8) for k, v in store_stats.items()})
+    df["Sales_norm"] = ((np.log1p(df["Sales"]) - means) / stds).astype(np.float32)
+    return df
 
 
 def build_sequences(df: pd.DataFrame, seq_len: int = DEFAULT_SEQ_LEN) -> tuple:
     """
-    Construye las secuencias de entrada para el modelo many-to-one.
+    Construye ventanas deslizantes para el modelo many-to-one.
 
-    Para cada tienda, ordena por fecha y genera ventanas deslizantes de
-    longitud seq_len sobre los días abiertos (todos los que llegan aquí
-    ya son Open==1 gracias a clean_train).
+    Para cada tienda (ordenada por fecha):
+        X_seq[i]    = SEQ_FEATURE_COLS en filas [i, i+seq_len)
+        X_static[i] = STATIC_CAT_COLS + STATIC_NUM_COLS del día i+seq_len
+        y[i]        = Sales_norm del día i+seq_len
 
-    La etiqueta y[i] es Sales_norm del día i+seq_len (el día a predecir).
-    Las features de secuencia X_seq[i] son las filas [i, i+seq_len) de SEQ_FEATURE_COLS.
-    Las features estáticas X_static[i] son las columnas STATIC_CAT_COLS + STATIC_NUM_COLS
-    del día i+seq_len (son constantes por tienda, pero se indexa así por consistencia).
-
-    SIN lag features explícitos: la secuencia de Sales_norm ya actúa como
-    contexto histórico (decisión cerrada en EDA — ver README).
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Split ya normalizado (contiene 'Sales_norm').
-    seq_len : int
-        Longitud de la ventana de contexto (días abiertos). Por defecto 30.
-
-    Returns
-    -------
-    (X_seq, X_static, y) : tuple de np.ndarray
-        X_seq   : shape (n_samples, seq_len, len(SEQ_FEATURE_COLS))  — float32
-        X_static: shape (n_samples, len(STATIC_CAT_COLS + STATIC_NUM_COLS))  — float32
-                  Las primeras len(STATIC_CAT_COLS) columnas son índices enteros (para Embedding).
-                  Las siguientes len(STATIC_NUM_COLS) columnas son numéricas normalizadas.
-        y       : shape (n_samples,)  — float32, Sales_norm del día objetivo.
+    Devuelve (X_seq, X_static, y) como arrays float32.
+    Shapes: (N, seq_len, n_seq_feats), (N, n_static), (N,).
     """
-    raise NotImplementedError
+    static_cols = STATIC_CAT_COLS + STATIC_NUM_COLS
+    seq_parts, stat_parts, y_parts = [], [], []
+
+    for _, grp in df.groupby("Store"):
+        grp = grp.sort_values("Date")
+        n = len(grp)
+        if n <= seq_len:
+            continue
+
+        seq  = grp[SEQ_FEATURE_COLS].to_numpy(dtype=np.float32)
+        stat = grp[static_cols].to_numpy(dtype=np.float32)
+        y    = grp["Sales_norm"].to_numpy(dtype=np.float32)
+
+        # sliding_window_view → (n-seq_len+1, n_feats, seq_len); [:-1] descarta la última ventana
+        # (no tiene label) y transpose convierte a (n-seq_len, seq_len, n_feats)
+        windows = np.lib.stride_tricks.sliding_window_view(seq, seq_len, axis=0)
+        windows = windows[:-1].transpose(0, 2, 1).copy()
+
+        seq_parts.append(windows)
+        stat_parts.append(stat[seq_len:])
+        y_parts.append(y[seq_len:])
+
+    return (
+        np.concatenate(seq_parts,  axis=0),
+        np.concatenate(stat_parts, axis=0),
+        np.concatenate(y_parts,    axis=0),
+    )
