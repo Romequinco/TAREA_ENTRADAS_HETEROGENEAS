@@ -81,9 +81,9 @@ def merge_store_features(train_df: pd.DataFrame, store_df: pd.DataFrame) -> pd.D
     CompetitionOpenSinceYear/Month → 0 cuando NaN (sin competencia conocida).
     """
     df = train_df.merge(store_df, on="Store", how="left")
-    df["CompetitionDistance"].fillna(df["CompetitionDistance"].median(), inplace=True)
-    df["CompetitionOpenSinceYear"].fillna(0, inplace=True)
-    df["CompetitionOpenSinceMonth"].fillna(0, inplace=True)
+    df["CompetitionDistance"] = df["CompetitionDistance"].fillna(df["CompetitionDistance"].median())
+    df["CompetitionOpenSinceYear"] = df["CompetitionOpenSinceYear"].fillna(0)
+    df["CompetitionOpenSinceMonth"] = df["CompetitionOpenSinceMonth"].fillna(0)
     # PromoInterval NaN (tiendas con Promo2==0) se mantiene: se codifica como 'None'
     return df
 
